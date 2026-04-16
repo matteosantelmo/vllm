@@ -142,6 +142,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -384,12 +385,22 @@ class GPUModelRunner(
         # layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
-                NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
+                NgramProposer
+                | SuffixDecodingProposer
+                | EagleProposer
+                | DraftModelProposer
+                | MedusaProposer
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.uses_draft_model():
+                self.drafter = DraftModelProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -405,7 +416,13 @@ class GPUModelRunner(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RejectionSampler(self.sampler)
+            self.rejection_sampler = RejectionSampler(
+                self.sampler,
+                use_entropy_aware_mixing=self.speculative_config.use_entropy_aware_mixing,
+                entropy_top_k=self.speculative_config.entropy_top_k,
+                entropy_aware_mixing=self.speculative_config.entropy_aware_mixing,
+                entropy_aware_alpha=self.speculative_config.entropy_aware_alpha,
+            )
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -583,6 +600,9 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._draft_token_ids_for_logits: torch.Tensor | None = None
+        self._draft_logits: torch.Tensor | None = None
+        self._draft_token_req_ids: list[str] | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -2556,10 +2576,14 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        scheduler_output: "SchedulerOutput",
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            self._draft_logits = None
+            self._draft_token_ids_for_logits = None
+            self._draft_token_req_ids = None
             # Update output token ids with tokens sampled in last step
             # if async scheduling and required by current sampling params.
             self.input_batch.update_async_output_token_ids()
@@ -2568,14 +2592,74 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
 
+        draft_logits = self._build_draft_logits_for_rejection(
+            scheduler_output=scheduler_output,
+            spec_decode_metadata=spec_decode_metadata,
+        )
+        # Cached draft logits are only valid for the immediate next verifier step.
+        self._draft_logits = None
+        self._draft_token_ids_for_logits = None
+        self._draft_token_req_ids = None
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            draft_logits,
             logits,
             sampling_metadata,
         )
         self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
+
+    def _build_draft_logits_for_rejection(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> torch.Tensor | None:
+        if (
+            spec_decode_metadata is None
+            or self.speculative_config is None
+            or not self.speculative_config.use_entropy_aware_mixing
+        ):
+            return None
+        if (
+            self._draft_logits is None
+            or self._draft_token_ids_for_logits is None
+            or self._draft_token_req_ids is None
+        ):
+            return None
+
+        req_to_prev_idx = {
+            req_id: idx for idx, req_id in enumerate(self._draft_token_req_ids)
+        }
+        flat_logits: list[torch.Tensor] = []
+        expected_tokens = int(sum(spec_decode_metadata.num_draft_tokens))
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+
+        for req_id in self.input_batch.req_ids:
+            draft_tokens = scheduled_spec_tokens.get(req_id, ())
+            if not draft_tokens:
+                continue
+            prev_idx = req_to_prev_idx.get(req_id)
+            if prev_idx is None:
+                return None
+            n = len(draft_tokens)
+            if n > self._draft_token_ids_for_logits.shape[1]:
+                return None
+            cached_tokens = self._draft_token_ids_for_logits[prev_idx, :n]
+            expected = torch.tensor(
+                draft_tokens,
+                dtype=cached_tokens.dtype,
+                device=cached_tokens.device,
+            )
+            if not torch.equal(cached_tokens, expected):
+                return None
+            flat_logits.append(self._draft_logits[prev_idx, :n])
+
+        if not flat_logits:
+            return None
+        draft_logits = torch.cat(flat_logits, dim=0).contiguous()
+        if draft_logits.shape[0] != expected_tokens:
+            return None
+        return draft_logits
 
     def _bookkeeping_sync(
         self,
@@ -3207,14 +3291,18 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits,
+                spec_decode_metadata,
+                scheduler_output,
+            )
 
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
+                draft_token_ids, draft_logits = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
                     self.input_batch.sampling_metadata,
@@ -3224,11 +3312,13 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                 )
+                self._draft_token_ids = draft_token_ids
+                self._cache_draft_outputs(draft_token_ids, draft_logits)
 
         spec_config = self.speculative_config
         use_padded_batch_for_eagle = (
             spec_config is not None
-            and spec_config.use_eagle()
+            and (spec_config.use_eagle() or spec_config.uses_draft_model())
             and not spec_config.disable_padded_drafter_batch
         )
         effective_drafter_max_model_len = self.max_model_len
@@ -3339,6 +3429,22 @@ class GPUModelRunner(
 
         return async_output
 
+    def _cache_draft_outputs(
+        self,
+        draft_token_ids: list[list[int]] | torch.Tensor,
+        draft_logits: torch.Tensor | None,
+    ) -> None:
+        # Cache metadata for entropy-aware verifier mixing in the next step.
+        if isinstance(draft_token_ids, torch.Tensor):
+            self._draft_token_ids_for_logits = draft_token_ids.detach().to(
+                dtype=torch.int32
+            )
+            self._draft_token_req_ids = self.input_batch.req_ids.copy()
+        else:
+            self._draft_token_ids_for_logits = None
+            self._draft_token_req_ids = None
+        self._draft_logits = draft_logits.detach() if draft_logits is not None else None
+
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._draft_token_ids is None:
             return None
@@ -3391,10 +3497,11 @@ class GPUModelRunner(
         aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
-    ) -> list[list[int]] | torch.Tensor:
+    ) -> tuple[list[list[int]] | torch.Tensor, torch.Tensor | None]:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        draft_logits: torch.Tensor | None = None
         if spec_config.method == "ngram":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
@@ -3434,7 +3541,7 @@ class GPUModelRunner(
                 target_hidden_states=hidden_states,
                 sampling_metadata=sampling_metadata,
             )
-        elif spec_config.use_eagle():
+        elif spec_config.use_eagle() or spec_config.uses_draft_model():
             assert isinstance(self.drafter, EagleProposer)
 
             if spec_config.disable_padded_drafter_batch:
@@ -3530,7 +3637,7 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
+            draft_token_ids, draft_logits = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -3541,7 +3648,7 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
             )
 
-        return draft_token_ids
+        return draft_token_ids, draft_logits
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}
@@ -4208,7 +4315,10 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and self.speculative_config.use_eagle():
+            if self.speculative_config and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            ):
                 assert isinstance(self.drafter, EagleProposer)
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
@@ -4319,10 +4429,10 @@ class GPUModelRunner(
             )
 
             num_tokens = sum(len(ids) for ids in draft_token_ids)
-            # draft_probs = torch.randn(
+            # draft_logits = torch.randn(
             #     num_tokens, logits.shape[-1], device=self.device,
             #     dtype=logits.dtype)
-            draft_probs = None
+            draft_logits = None
             logits = torch.randn(
                 num_tokens + num_reqs,
                 logits.shape[-1],
@@ -4331,7 +4441,7 @@ class GPUModelRunner(
             )
             self.rejection_sampler(
                 dummy_spec_decode_metadata,
-                draft_probs,
+                draft_logits,
                 logits,
                 dummy_metadata,
             )
@@ -5402,7 +5512,10 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
-        if self.speculative_config and self.speculative_config.use_eagle():
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.uses_draft_model()
+        ):
             assert isinstance(self.drafter, EagleProposer)
             # validate all draft model layers belong to the same kv cache
             # group

@@ -102,6 +102,16 @@ class SpeculativeConfig:
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
 
+    # Entropy-aware speculative decoding (EASD) verifier controls.
+    use_entropy_aware_mixing: bool = False
+    """Enable entropy-aware speculative decoding in the rejection sampler."""
+    entropy_top_k: int = Field(default=50, ge=1)
+    """Top-k used to estimate draft entropy for EASD."""
+    entropy_aware_mixing: Literal["geometric", "convex"] = "geometric"
+    """How to blend draft and target distributions for EASD."""
+    entropy_aware_alpha: Literal["linear", "sqrt", "sqrt2", "sigmoid"] = "linear"
+    """How to reshape entropy-derived alpha for EASD."""
+
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
     """Maximum size of ngram token window when using Ngram proposer, required
@@ -377,12 +387,14 @@ class SpeculativeConfig:
                         )
                 else:
                     self.method = "draft_model"
-                    raise NotImplementedError(
-                        "Speculative decoding with draft model is not "
-                        "supported yet. Please consider using other "
-                        "speculative decoding methods such as ngram, medusa, "
-                        "eagle, or mtp."
+
+                if self.method == "draft_model" and not self.disable_padded_drafter_batch:
+                    logger.warning(
+                        "draft_model speculation currently requires "
+                        "disable_padded_drafter_batch=True in this vLLM commit. "
+                        "Forcing disable_padded_drafter_batch=True."
                     )
+                    self.disable_padded_drafter_batch = True
 
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3"):
@@ -632,10 +644,31 @@ class SpeculativeConfig:
                 f"Got {self.target_model_config.hf_text_config.model_type=}"
             )
 
+        self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def verify_equal_vocab_size_if_draft_model(self) -> None:
+        if (
+            self.method == "draft_model"
+            and self.target_model_config is not None
+            and self.draft_model_config is not None
+        ):
+            target_vocab_size = self.target_model_config.get_vocab_size()
+            draft_vocab_size = self.draft_model_config.get_vocab_size()
+            if target_vocab_size != draft_vocab_size:
+                raise ValueError(
+                    "Target and draft model should have the same vocabulary size. "
+                    f"Target model vocab_size={target_vocab_size}. "
+                    f"Draft model vocab_size={draft_vocab_size}. "
+                    "Using models with different tokenizers can cause "
+                    "out-of-bounds errors during speculative decoding."
+                )
 
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "mtp")
+
+    def uses_draft_model(self) -> bool:
+        return self.method == "draft_model"
 
     def __repr__(self) -> str:
         method = self.method

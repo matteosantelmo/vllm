@@ -495,7 +495,9 @@ def _support_torch_compile(
         # Prepare inductor config patches
         # assume_32bit_indexing is only available in torch 2.10.0.dev+
         inductor_config_patches = {}
-        if is_torch_equal_or_newer("2.10.0.dev"):
+        if is_torch_equal_or_newer("2.10.0.dev") and hasattr(
+            torch._inductor.config, "assume_32bit_indexing"
+        ):
             inductor_config_patches["assume_32bit_indexing"] = True
 
         with (

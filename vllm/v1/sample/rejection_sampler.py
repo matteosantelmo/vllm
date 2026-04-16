@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Sequence
 from dataclasses import replace
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -49,18 +51,38 @@ class RejectionSampler(nn.Module):
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
 
-    def __init__(self, sampler: Sampler):
+    def __init__(
+        self,
+        sampler: Sampler,
+        use_entropy_aware_mixing: bool = False,
+        entropy_top_k: int = 50,
+        entropy_aware_mixing: str = "geometric",
+        entropy_aware_alpha: str = "linear",
+    ):
         super().__init__()
         self.sampler = sampler
+        self.use_entropy_aware_mixing = use_entropy_aware_mixing
+        self.entropy_top_k = entropy_top_k
+        self.entropy_aware_mixing = entropy_aware_mixing
+        self.entropy_aware_alpha = entropy_aware_alpha
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
+        if self.use_entropy_aware_mixing:
+            logger.info(
+                "Entropy-aware speculative decoding enabled "
+                "(entropy_top_k=%d, entropy_aware_mixing=%s, "
+                "entropy_aware_alpha=%s)",
+                self.entropy_top_k,
+                self.entropy_aware_mixing,
+                self.entropy_aware_alpha,
+            )
 
     def forward(
         self,
         metadata: SpecDecodeMetadata,
         # [num_tokens, vocab_size]
-        draft_probs: torch.Tensor | None,
+        draft_logits: torch.Tensor | None,
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
@@ -69,10 +91,10 @@ class RejectionSampler(nn.Module):
         Args:
             metadata:
                 Metadata for spec decoding.
-            draft_probs (Optional[torch.Tensor]):
-                Probability distribution for the draft tokens. Shape is
-                [num_tokens, vocab_size]. Can be None if probabilities are
-                not provided, which is the case for ngram spec decode.
+            draft_logits (Optional[torch.Tensor]):
+                Draft logits for the speculative tokens. Shape is
+                [num_tokens, vocab_size]. Can be None for methods that do not
+                provide draft logits.
             logits (torch.Tensor):
                 Target model's logits probability distribution.
                 Shape is [num_tokens + batch_size, vocab_size]. Here,
@@ -112,6 +134,14 @@ class RejectionSampler(nn.Module):
             else "raw_logits",
         )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
+        if self.use_entropy_aware_mixing and draft_logits is not None:
+            has_draft_tokens = torch.tensor(
+                [n > 0 for n in metadata.num_draft_tokens],
+                dtype=torch.bool,
+                device=bonus_token_ids.device,
+            )
+            bonus_token_ids = bonus_token_ids.clone()
+            bonus_token_ids[has_draft_tokens] = PLACEHOLDER_TOKEN_ID
 
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
@@ -119,6 +149,20 @@ class RejectionSampler(nn.Module):
         raw_target_logits = logits[target_logits_indices]
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
+        if (
+            self.use_entropy_aware_mixing
+            and draft_logits is not None
+            and draft_logits.shape == raw_target_logits.shape
+        ):
+            alpha = self._compute_easd_alpha(draft_logits, self.entropy_top_k)
+            raw_target_logits = self._compute_easd_mixture(
+                target_logits=raw_target_logits,
+                draft_logits=draft_logits.to(raw_target_logits.dtype),
+                alpha=alpha,
+                entropy_aware_mixing=self.entropy_aware_mixing,
+                entropy_aware_alpha=self.entropy_aware_alpha,
+            )
+
         target_logits = self.apply_logits_processors(
             raw_target_logits, sampling_metadata, metadata
         )
@@ -138,7 +182,7 @@ class RejectionSampler(nn.Module):
             metadata.num_draft_tokens,
             metadata.max_spec_len,
             metadata.cu_num_draft_tokens,
-            draft_probs,
+            None,  # draft_probs
             target_probs,
             bonus_token_ids,
             sampling_metadata,
@@ -306,6 +350,59 @@ class RejectionSampler(nn.Module):
             output_token_ids,
         )
         return logits
+
+    @staticmethod
+    def _compute_easd_alpha(
+        draft_logits: torch.Tensor,
+        entropy_top_k: int = 50,
+    ) -> torch.Tensor:
+        draft_logits = draft_logits.to(torch.float32)
+        top_k = min(entropy_top_k, draft_logits.shape[-1])
+        if top_k <= 1:
+            return torch.zeros_like(draft_logits[:, 0], dtype=torch.float32)
+        top_k_logits = torch.topk(draft_logits, top_k, dim=-1, sorted=False).values
+        top_k_log_probs = top_k_logits - torch.logsumexp(
+            top_k_logits, dim=-1, keepdim=True
+        )
+        top_k_probs = top_k_log_probs.exp()
+        entropy = -(top_k_probs * top_k_log_probs).sum(dim=-1)
+        return (entropy / math.log(top_k)).clamp_(0.0, 1.0)
+
+    @staticmethod
+    def _compute_easd_mixture(
+        target_logits: torch.Tensor,
+        draft_logits: torch.Tensor,
+        alpha: torch.Tensor,
+        entropy_aware_mixing: str = "geometric",
+        entropy_aware_alpha: str = "linear",
+    ) -> torch.Tensor:
+        target_logits = target_logits.to(torch.float32)
+        draft_logits = draft_logits.to(torch.float32)
+        beta = alpha.to(torch.float32).unsqueeze(-1)
+        if entropy_aware_alpha == "sqrt":
+            beta = torch.sqrt(beta)
+        elif entropy_aware_alpha == "sqrt2":
+            beta = torch.sqrt(torch.sqrt(beta))
+        elif entropy_aware_alpha == "sigmoid":
+            beta = torch.sigmoid(30 * (beta - 0.1))
+        elif entropy_aware_alpha != "linear":
+            raise ValueError(
+                f"Unsupported entropy_aware_alpha: {entropy_aware_alpha}"
+            )
+
+        if entropy_aware_mixing == "geometric":
+            # Avoid torch.lerp dtype constraints on `weight` by using explicit
+            # linear interpolation in float32.
+            beta = beta.to(target_logits.dtype)
+            return draft_logits + (target_logits - draft_logits) * beta
+        if entropy_aware_mixing == "convex":
+            beta = beta.clamp(1e-8, 1 - 1e-8)
+            log_beta = beta.log()
+            log_one_minus_beta = torch.log1p(-beta)
+            target_term = F.log_softmax(target_logits, dim=-1) + log_beta
+            draft_term = F.log_softmax(draft_logits, dim=-1) + log_one_minus_beta
+            return torch.logaddexp(target_term, draft_term)
+        raise ValueError(f"Unsupported entropy_aware_mixing: {entropy_aware_mixing}")
 
     @staticmethod
     def _combine_outputs_with_spec_tokens(
