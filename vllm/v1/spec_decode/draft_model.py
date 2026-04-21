@@ -37,6 +37,7 @@ class DraftModelProposer(EagleProposer):
         )
         self._raise_if_multimodal()
         self._raise_if_mrope()
+        self._raise_if_padded_drafter_batch_disabled()
         self._raise_if_vocab_size_mismatch()
         self._raise_if_draft_tp_mismatch()
 
@@ -52,6 +53,14 @@ class DraftModelProposer(EagleProposer):
             raise NotImplementedError(
                 "Speculative decoding with draft models does not support "
                 "M-RoPE yet."
+            )
+
+    def _raise_if_padded_drafter_batch_disabled(self) -> None:
+        if self.vllm_config.speculative_config.disable_padded_drafter_batch:
+            raise NotImplementedError(
+                "Speculative decoding with draft models only supports "
+                "padded drafter batch. Please don't pass "
+                "--disable-padded-drafter-batch in the speculative_config."
             )
 
     def _raise_if_vocab_size_mismatch(self) -> None:

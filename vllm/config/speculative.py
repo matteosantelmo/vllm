@@ -388,14 +388,6 @@ class SpeculativeConfig:
                 else:
                     self.method = "draft_model"
 
-                if self.method == "draft_model" and not self.disable_padded_drafter_batch:
-                    logger.warning(
-                        "draft_model speculation currently requires "
-                        "disable_padded_drafter_batch=True in this vLLM commit. "
-                        "Forcing disable_padded_drafter_batch=True."
-                    )
-                    self.disable_padded_drafter_batch = True
-
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3"):
                     from vllm.transformers_utils.configs import SpeculatorsConfig

@@ -600,7 +600,6 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
-        self._draft_token_ids_for_logits: torch.Tensor | None = None
         self._draft_logits: torch.Tensor | None = None
         self._draft_token_req_ids: list[str] | None = None
         self.transfer_event = torch.Event()
@@ -2582,7 +2581,6 @@ class GPUModelRunner(
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             self._draft_logits = None
-            self._draft_token_ids_for_logits = None
             self._draft_token_req_ids = None
             # Update output token ids with tokens sampled in last step
             # if async scheduling and required by current sampling params.
@@ -2598,7 +2596,6 @@ class GPUModelRunner(
         )
         # Cached draft logits are only valid for the immediate next verifier step.
         self._draft_logits = None
-        self._draft_token_ids_for_logits = None
         self._draft_token_req_ids = None
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -2614,50 +2611,47 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> torch.Tensor | None:
-        if (
-            spec_decode_metadata is None
-            or self.speculative_config is None
-            or not self.speculative_config.use_entropy_aware_mixing
-        ):
+        del scheduler_output
+        if spec_decode_metadata is None:
             return None
-        if (
-            self._draft_logits is None
-            or self._draft_token_ids_for_logits is None
-            or self._draft_token_req_ids is None
-        ):
+        if self._draft_logits is None or self._draft_token_req_ids is None:
+            return None
+
+        if self._draft_logits.ndim != 3:
             return None
 
         req_to_prev_idx = {
-            req_id: idx for idx, req_id in enumerate(self._draft_token_req_ids)
+            req_id: i for i, req_id in enumerate(self._draft_token_req_ids)
         }
-        flat_logits: list[torch.Tensor] = []
-        expected_tokens = int(sum(spec_decode_metadata.num_draft_tokens))
-        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        cur_req_ids = self.input_batch.req_ids
 
-        for req_id in self.input_batch.req_ids:
-            draft_tokens = scheduled_spec_tokens.get(req_id, ())
-            if not draft_tokens:
+        expected_prev_reqs = len(self._draft_token_req_ids)
+        if self._draft_logits.shape[0] != expected_prev_reqs:
+            return None
+
+        if len(spec_decode_metadata.num_draft_tokens) != len(cur_req_ids):
+            return None
+
+        max_cached_steps = self._draft_logits.shape[1]
+
+        rows: list[torch.Tensor] = []
+        for cur_idx, req_id in enumerate(cur_req_ids):
+            n = int(spec_decode_metadata.num_draft_tokens[cur_idx])
+            if n <= 0:
                 continue
             prev_idx = req_to_prev_idx.get(req_id)
             if prev_idx is None:
                 return None
-            n = len(draft_tokens)
-            if n > self._draft_token_ids_for_logits.shape[1]:
+            if n > max_cached_steps:
                 return None
-            cached_tokens = self._draft_token_ids_for_logits[prev_idx, :n]
-            expected = torch.tensor(
-                draft_tokens,
-                dtype=cached_tokens.dtype,
-                device=cached_tokens.device,
-            )
-            if not torch.equal(cached_tokens, expected):
-                return None
-            flat_logits.append(self._draft_logits[prev_idx, :n])
+            rows.append(self._draft_logits[prev_idx, :n, :])
 
-        if not flat_logits:
+        if not rows:
             return None
-        draft_logits = torch.cat(flat_logits, dim=0).contiguous()
-        if draft_logits.shape[0] != expected_tokens:
+
+        draft_logits = torch.cat(rows, dim=0).contiguous()
+        expected_num_draft = spec_decode_metadata.draft_token_ids.shape[0]
+        if draft_logits.shape[0] != expected_num_draft:
             return None
         return draft_logits
 
@@ -3297,6 +3291,9 @@ class GPUModelRunner(
                 scheduler_output,
             )
 
+        self._draft_token_ids = None
+        self._draft_logits = None
+        self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
@@ -3436,12 +3433,8 @@ class GPUModelRunner(
     ) -> None:
         # Cache metadata for entropy-aware verifier mixing in the next step.
         if isinstance(draft_token_ids, torch.Tensor):
-            self._draft_token_ids_for_logits = draft_token_ids.detach().to(
-                dtype=torch.int32
-            )
             self._draft_token_req_ids = self.input_batch.req_ids.copy()
         else:
-            self._draft_token_ids_for_logits = None
             self._draft_token_req_ids = None
         self._draft_logits = draft_logits.detach() if draft_logits is not None else None
 

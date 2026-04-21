@@ -55,7 +55,7 @@ class RejectionSampler(nn.Module):
         self,
         sampler: Sampler,
         use_entropy_aware_mixing: bool = False,
-        entropy_top_k: int = 50,
+        entropy_top_k: int = 20,
         entropy_aware_mixing: str = "geometric",
         entropy_aware_alpha: str = "linear",
     ):
@@ -119,52 +119,61 @@ class RejectionSampler(nn.Module):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
-        bonus_logits = logits[bonus_logits_indices]
-        bonus_sampler_output = self.sampler(
-            logits=bonus_logits,
-            sampling_metadata=replace(
-                sampling_metadata,
-                max_num_logprobs=-1,
-            ),
-            predict_bonus_token=True,
-            # Override the logprobs mode to return logits because they are
-            # needed later to compute the accepted token logprobs.
-            logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
-        )
-        bonus_token_ids = bonus_sampler_output.sampled_token_ids
-        if self.use_entropy_aware_mixing and draft_logits is not None:
-            has_draft_tokens = torch.tensor(
-                [n > 0 for n in metadata.num_draft_tokens],
-                dtype=torch.bool,
-                device=bonus_token_ids.device,
-            )
-            bonus_token_ids = bonus_token_ids.clone()
-            bonus_token_ids[has_draft_tokens] = PLACEHOLDER_TOKEN_ID
 
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
         # it is safe to update `target_logits` in place.
         raw_target_logits = logits[target_logits_indices]
-        # Use float32 for the target_logits.
-        raw_target_logits = raw_target_logits.to(torch.float32)
-        if (
-            self.use_entropy_aware_mixing
-            and draft_logits is not None
-            and draft_logits.shape == raw_target_logits.shape
-        ):
-            alpha = self._compute_easd_alpha(draft_logits, self.entropy_top_k)
-            raw_target_logits = self._compute_easd_mixture(
-                target_logits=raw_target_logits,
-                draft_logits=draft_logits.to(raw_target_logits.dtype),
-                alpha=alpha,
-                entropy_aware_mixing=self.entropy_aware_mixing,
-                entropy_aware_alpha=self.entropy_aware_alpha,
+        target_logits = raw_target_logits
+
+        if self.use_entropy_aware_mixing and draft_logits is not None:
+            # Compute target mixture.
+            alpha = self._compute_easd_alpha(
+                draft_logits, self.entropy_top_k
             )
+            target_logits = self._compute_easd_mixture(
+                target_logits,
+                draft_logits,
+                alpha,
+                self.entropy_aware_mixing,
+                self.entropy_aware_alpha,
+            )
+            bonus_token_ids = torch.full(
+                (len(metadata.num_draft_tokens),),
+                PLACEHOLDER_TOKEN_ID,
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            bonus_logits_for_logprobs = torch.zeros(
+                (len(metadata.num_draft_tokens), logits.shape[-1]),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+        else:
+            bonus_logits = logits[bonus_logits_indices]
+            bonus_sampler_output = self.sampler(
+                logits=bonus_logits,
+                sampling_metadata=replace(
+                    sampling_metadata,
+                    max_num_logprobs=-1,
+                ),
+                predict_bonus_token=True,
+                # Override the logprobs mode to return logits because they are
+                # needed later to compute the accepted token logprobs.
+                logprobs_mode_override="processed_logits"
+                if self.is_processed_logprobs_mode
+                else "raw_logits",
+            )
+            bonus_token_ids = bonus_sampler_output.sampled_token_ids
+            bonus_logits_for_logprobs = bonus_sampler_output.logprobs_tensors.logprobs
+
+        draft_probs = None
+        if not self.is_processed_logprobs_mode:
+            if target_logits.data_ptr() == raw_target_logits.data_ptr():
+                target_logits = target_logits.clone()
 
         target_logits = self.apply_logits_processors(
-            raw_target_logits, sampling_metadata, metadata
+            target_logits, sampling_metadata, metadata
         )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
@@ -182,7 +191,7 @@ class RejectionSampler(nn.Module):
             metadata.num_draft_tokens,
             metadata.max_spec_len,
             metadata.cu_num_draft_tokens,
-            None,  # draft_probs
+            draft_probs,
             target_probs,
             bonus_token_ids,
             sampling_metadata,
@@ -195,7 +204,7 @@ class RejectionSampler(nn.Module):
                 metadata,
                 logits,
                 target_logits if self.is_processed_logprobs_mode else raw_target_logits,
-                bonus_sampler_output.logprobs_tensors.logprobs,
+                bonus_logits_for_logprobs,
                 output_token_ids,
             )
 
@@ -356,17 +365,15 @@ class RejectionSampler(nn.Module):
         draft_logits: torch.Tensor,
         entropy_top_k: int = 50,
     ) -> torch.Tensor:
-        draft_logits = draft_logits.to(torch.float32)
         top_k = min(entropy_top_k, draft_logits.shape[-1])
         if top_k <= 1:
-            return torch.zeros_like(draft_logits[:, 0], dtype=torch.float32)
+            return torch.zeros_like(draft_logits[..., 0], dtype=torch.float32)
         top_k_logits = torch.topk(draft_logits, top_k, dim=-1, sorted=False).values
-        top_k_log_probs = top_k_logits - torch.logsumexp(
-            top_k_logits, dim=-1, keepdim=True
-        )
+        top_k_log_probs = top_k_logits - torch.logsumexp(top_k_logits, dim=-1,
+                                                         keepdim=True)
         top_k_probs = top_k_log_probs.exp()
-        entropy = -(top_k_probs * top_k_log_probs).sum(dim=-1)
-        return (entropy / math.log(top_k)).clamp_(0.0, 1.0)
+        entropy_approx = -(top_k_probs * top_k_log_probs).sum(dim=-1)
+        return (entropy_approx / math.log(entropy_top_k)).clamp_(0.0, 1.0)
 
     @staticmethod
     def _compute_easd_mixture(
@@ -376,33 +383,34 @@ class RejectionSampler(nn.Module):
         entropy_aware_mixing: str = "geometric",
         entropy_aware_alpha: str = "linear",
     ) -> torch.Tensor:
-        target_logits = target_logits.to(torch.float32)
-        draft_logits = draft_logits.to(torch.float32)
-        beta = alpha.to(torch.float32).unsqueeze(-1)
+        alpha_expanded = alpha.unsqueeze(-1)
         if entropy_aware_alpha == "sqrt":
-            beta = torch.sqrt(beta)
+            alpha_expanded = torch.sqrt(alpha_expanded)
         elif entropy_aware_alpha == "sqrt2":
-            beta = torch.sqrt(torch.sqrt(beta))
+            alpha_expanded = torch.sqrt(torch.sqrt(alpha_expanded))
         elif entropy_aware_alpha == "sigmoid":
-            beta = torch.sigmoid(30 * (beta - 0.1))
-        elif entropy_aware_alpha != "linear":
-            raise ValueError(
-                f"Unsupported entropy_aware_alpha: {entropy_aware_alpha}"
-            )
+            alpha_expanded = torch.sigmoid(30 * (alpha_expanded - 0.1))
+        elif entropy_aware_alpha == "linear":
+            pass
+        else:
+            raise ValueError(f"Unsupported entropy_aware_alpha: {entropy_aware_alpha}")
 
         if entropy_aware_mixing == "geometric":
-            # Avoid torch.lerp dtype constraints on `weight` by using explicit
-            # linear interpolation in float32.
-            beta = beta.to(target_logits.dtype)
-            return draft_logits + (target_logits - draft_logits) * beta
-        if entropy_aware_mixing == "convex":
-            beta = beta.clamp(1e-8, 1 - 1e-8)
-            log_beta = beta.log()
-            log_one_minus_beta = torch.log1p(-beta)
-            target_term = F.log_softmax(target_logits, dim=-1) + log_beta
-            draft_term = F.log_softmax(draft_logits, dim=-1) + log_one_minus_beta
-            return torch.logaddexp(target_term, draft_term)
-        raise ValueError(f"Unsupported entropy_aware_mixing: {entropy_aware_mixing}")
+            return torch.lerp(draft_logits, target_logits, alpha_expanded)
+        elif entropy_aware_mixing == "convex":
+            log_alpha = torch.log(alpha_expanded)
+            log_one_minus_alpha = torch.log1p(-alpha_expanded)
+
+            mixed = F.log_softmax(target_logits, dim=-1)
+            mixed.add_(log_alpha)
+
+            draft_term = F.log_softmax(draft_logits, dim=-1)
+            draft_term.add_(log_one_minus_alpha)
+
+            return torch.logaddexp(mixed, draft_term)
+        raise ValueError(
+            f"Unsupported entropy_aware_mixing: {entropy_aware_mixing}"
+        )
 
     @staticmethod
     def _combine_outputs_with_spec_tokens(
