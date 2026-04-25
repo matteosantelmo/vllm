@@ -131,6 +131,8 @@ class RejectionSampler(nn.Module):
             alpha = self._compute_easd_alpha(
                 draft_logits, self.entropy_top_k
             )
+            # Guard against non-finite alpha values from extreme logits.
+            alpha = torch.nan_to_num(alpha, nan=1.0, posinf=1.0, neginf=0.0)
             target_logits = self._compute_easd_mixture(
                 target_logits,
                 draft_logits,
@@ -138,6 +140,11 @@ class RejectionSampler(nn.Module):
                 self.entropy_aware_mixing,
                 self.entropy_aware_alpha,
             )
+            # Non-finite logits can produce invalid sampled token ids on some
+            # kernels; fall back to raw target logits for those rows.
+            if not torch.isfinite(target_logits).all():
+                finite_rows = torch.isfinite(target_logits).all(dim=-1, keepdim=True)
+                target_logits = torch.where(finite_rows, target_logits, raw_target_logits)
             bonus_token_ids = torch.full(
                 (len(metadata.num_draft_tokens),),
                 PLACEHOLDER_TOKEN_ID,
@@ -373,7 +380,8 @@ class RejectionSampler(nn.Module):
                                                          keepdim=True)
         top_k_probs = top_k_log_probs.exp()
         entropy_approx = -(top_k_probs * top_k_log_probs).sum(dim=-1)
-        return (entropy_approx / math.log(entropy_top_k)).clamp_(0.0, 1.0)
+        # Normalize with the actual effective top-k used in this batch.
+        return (entropy_approx / math.log(top_k)).clamp_(0.0, 1.0)
 
     @staticmethod
     def _compute_easd_mixture(
@@ -395,9 +403,15 @@ class RejectionSampler(nn.Module):
         else:
             raise ValueError(f"Unsupported entropy_aware_alpha: {entropy_aware_alpha}")
 
+        # Keep alpha in a numerically safe range before computing the mixture.
+        alpha_expanded = torch.nan_to_num(alpha_expanded, nan=1.0, posinf=1.0, neginf=0.0)
+        alpha_expanded = alpha_expanded.clamp(0.0, 1.0)
+
         if entropy_aware_mixing == "geometric":
             return torch.lerp(draft_logits, target_logits, alpha_expanded)
         elif entropy_aware_mixing == "convex":
+            eps = torch.finfo(alpha_expanded.dtype).eps
+            alpha_expanded = alpha_expanded.clamp(eps, 1.0 - eps)
             log_alpha = torch.log(alpha_expanded)
             log_one_minus_alpha = torch.log1p(-alpha_expanded)
 
